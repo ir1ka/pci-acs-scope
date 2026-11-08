@@ -36,7 +36,7 @@ def main():
         from preinstall import text
         preinst=source/'debian/pci-acs-scope-native.preinst'
         preinst.write_text(text(ROOT));preinst.chmod(0o755)
-        for filename in ('README.md', 'Makefile', 'dkms.conf', 'LICENSE'):
+        for filename in ('README.md','README.zh-CN.md', 'Makefile', 'dkms.conf', 'LICENSE'):
             shutil.copy2(ROOT/filename, source/filename)
         for item in sorted(source.rglob('*'), reverse=True):
             os.utime(item, (epoch, epoch), follow_symlinks=False)
