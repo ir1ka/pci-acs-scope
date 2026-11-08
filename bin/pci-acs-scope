@@ -1,0 +1,315 @@
+#!/usr/bin/python3
+"""Inspect or explicitly change standard ACS in selected PCIe root subtrees."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+BACKEND=Path('/usr/share/pci-acs-scope/backend')
+import re
+import subprocess
+import sys
+
+DEVICES = Path('/sys/bus/pci/devices')
+MODULE = Path('/sys/module/pci_acs_scope')
+SNAPSHOT = Path('/proc/pci_acs_scope_snapshot')
+MASKS = {'off': 0x7f, 'redirect': 0x2c}
+FLAGS = ('SourceValidation', 'TranslationBlocking', 'RequestRedirect',
+         'CompletionRedirect', 'UpstreamForwarding', 'EgressControl', 'DirectTranslatedP2P')
+
+
+def normalize(value):
+    if re.fullmatch(r'[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]', value):
+        value = '0000:' + value
+    if not re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\.[0-7]', value):
+        raise ValueError('Expected an exact PCIe port BDF: ' + value)
+    return value.lower()
+
+
+class PortAction(argparse.Action):
+    def __call__(self,parser,namespace,values,option_string=None):
+        entries=list(getattr(namespace,self.dest,None)or [])
+        for item in ([values]if isinstance(values,str)else values):
+            try:entries.extend((normalize(v),False)for v in item.split(','))
+            except ValueError as error:parser.error(str(error))
+        setattr(namespace,self.dest,entries)
+
+
+class IncludeAction(argparse.Action):
+    def __call__(self,parser,namespace,values,option_string=None):
+        entries=list(getattr(namespace,'port_specs',None)or [])
+        if not entries:parser.error('--include requires a preceding --port')
+        entries[-1]=(entries[-1][0],True)
+        namespace.port_specs=entries
+
+
+def add_port_arguments(parser,include=True):
+    parser.add_argument('--port',dest='port_specs',action=PortAction,metavar='BDF',help='Repeat for each root/upstream/downstream port')
+    parser.add_argument('--ports',dest='port_specs',action=PortAction,nargs='+',metavar='BDF',help='Compatibility list; commas also accepted')
+    if include:
+        parser.add_argument('--include',action=IncludeAction,nargs=0,help='Include the preceding port itself; default descendants only')
+        parser.add_argument('--include-ports',action='store_true',help='Include all listed boundary ports')
+
+
+def parse_scope(args):
+    entries=args.port_specs or []
+    if not entries:raise ValueError('Specify at least one --port or --ports')
+    ports=sorted({p for p,_ in entries})
+    if len(ports)>32:raise ValueError('At most 32 selected ports are supported')
+    included=ports if getattr(args,'include_ports',False)else sorted({p for p,flag in entries if flag})
+    return ports,included
+
+
+def include_set(ports,included):
+    if isinstance(included,bool):return set(ports)if included else set()
+    result=set(included or [])
+    if result-set(ports):raise ValueError('Included boundary is outside selected ports')
+    return result
+
+
+def read(fd, offset, size):
+    data = os.pread(fd, size, offset)
+    if len(data) != size:
+        raise OSError(f'Short PCI config read at {offset:#x}; root access required')
+    return int.from_bytes(data, 'little')
+
+
+def capabilities(fd, extended):
+    offset = 0x100 if extended else read(fd, 0x34, 1)
+    seen = set()
+    while offset:
+        limit, minimum, size = (0xffc, 0x100, 4) if extended else (0xfc, 0x40, 2)
+        if offset in seen or offset < minimum or offset > limit or offset & 3:
+            raise ValueError(f'Malformed PCI capability chain at {offset:#x}')
+        seen.add(offset)
+        header = read(fd, offset, size)
+        if extended and header in (0, 0xffffffff):
+            return
+        yield header & (0xffff if extended else 0xff), offset
+        offset = ((header >> 20) & 0xfff) if extended else ((header >> 8) & 0xff)
+
+
+def root_path(bdf, devices):
+    path = devices / bdf
+    real = path.resolve(strict=True)
+    with path.joinpath('config').open('rb', buffering=0) as f:
+        if read(f.fileno(), 0, 2) in (0, 0xffff):
+            raise ValueError('Device unavailable: ' + bdf)
+        for cap, offset in capabilities(f.fileno(), False):
+            if cap == 0x10 and (read(f.fileno(), offset + 2, 2) >> 4) & 0xf in (4,5,6):
+                return real
+    raise ValueError('Not a PCIe root/upstream/downstream port: ' + bdf)
+
+
+def hardware_root(path):
+    for node in (path,*path.parents):
+        if not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]',node.name):continue
+        with (node/'config').open('rb',buffering=0)as f:
+            for cap,offset in capabilities(f.fileno(),False):
+                if cap==0x10 and (read(f.fileno(),offset+2,2)>>4)&0xf==4:return node.name
+    raise ValueError('No PCIe root ancestor for '+str(path))
+
+
+def boundary(row):
+    return row.get('scope_boundary',row['bdf']==row.get('root_port'))
+
+
+def inventory(ports, devices=DEVICES):
+    roots = {p: root_path(p, devices) for p in ports}
+    anchors = {p: hardware_root(path)for p,path in roots.items()}
+    rows = []
+    for device in sorted(devices.iterdir()):
+        real = device.resolve(strict=True)
+        scope = [p for p, root in roots.items() if real == root or root in real.parents]
+        if not scope:
+            continue
+        row = {'bdf': device.name, 'root_port': anchors[scope[0]], 'scope_ports': scope, 'scope_boundary': device.name in roots, 'path': str(real), 'acs': None}
+        row['class'] = device.joinpath('class').read_text().strip() if device.joinpath('class').exists() else None
+        row['driver'] = device.joinpath('driver').resolve().name if device.joinpath('driver').exists() else None
+        row['iommu_group'] = device.joinpath('iommu_group').resolve().name if device.joinpath('iommu_group').exists() else None
+        dtype = device / 'iommu_group/type'
+        row['iommu_type'] = dtype.read_text().strip() if dtype.exists() else None
+        with device.joinpath('config').open('rb', buffering=0) as f:
+            fd = f.fileno()
+            row['vendor_device'] = f'{read(fd, 0, 4):08x}'
+            if row['vendor_device'] == 'ffffffff':
+                raise ValueError('Device unavailable: ' + device.name)
+            if os.fstat(fd).st_size <= 256:
+                row['no_acs_reason'] = 'No extended configuration space'
+            else:
+                for cap, offset in capabilities(fd, True):
+                    if cap == 0xd:
+                        support, ctrl = read(fd, offset + 4, 2), read(fd, offset + 6, 2)
+                        if support == 0xffff or ctrl == 0xffff:
+                            raise ValueError('Invalid ACS registers: ' + device.name)
+                        row['acs'] = {'offset': offset, 'cap': support, 'ctrl': ctrl,
+                                      'enabled': [n for i, n in enumerate(FLAGS) if ctrl & (1 << i)]}
+                        break
+        rows.append(row)
+    return rows
+
+
+def status(ports):
+    return {'schema':1,'project':'pci-acs-scope','ports': ports, 'root_ports': ports, 'mode': 'read-only',
+            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'kernel': os.uname().release, 'devices': inventory(ports)}
+
+
+def save_new(path, report):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(report, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def kernel_snapshot():
+    result=json.loads(SNAPSHOT.read_text())
+    if result.get('schema')!=1 or result.get('policy')not in MASKS:raise RuntimeError('Unsupported kernel snapshot')
+    return result
+
+
+def disable(ports, policy, save, require_idle=False, power=True,include_ports=False):
+    included=include_set(ports,include_ports)
+    if MODULE.exists():raise ValueError('Module already loaded; restore it or use reapply')
+    companion=Path(str(save)+'.kernel.json')
+    if companion.exists():raise ValueError('Kernel snapshot file already exists: '+str(companion))
+    with contextlib.nullcontext():
+        report=status(ports)
+        report.update(policy=policy,included_ports=sorted(included),mask=MASKS[policy],snapshot_kind='userspace-before-apply',kernel_snapshot=str(companion))
+        save_new(save,report)
+        # Reserve the authoritative output before changing PCI state.
+        fd=os.open(companion,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        try:
+            args=['/usr/sbin/modprobe','pci_acs_scope','execute=1','ports='+','.join(ports),'include_ports=0','policy='+policy]
+            if included:args.append('include='+','.join(sorted(included)))
+            if require_idle:args.append('require_idle=1')
+            if power:args.append('wake=1')
+            subprocess.run(args,check=True,start_new_session=True)
+            actual=kernel_snapshot()
+            if actual['ports']!=ports or actual['policy']!=policy or set(actual.get('included_ports',ports if actual.get('include_ports',True)else []))!=included:raise RuntimeError('Kernel applied scope/policy mismatch')
+            data=(json.dumps(actual,indent=2)+'\n').encode()
+            with os.fdopen(fd,'wb')as f:fd=-1;f.write(data);f.flush();os.fsync(f.fileno())
+            if (MODULE/'parameters/failed').read_text().strip()!='N':raise RuntimeError('Module reported partial failure')
+            after=status(ports)
+            if {r['bdf']for r in report['devices']}!={r['bdf']for r in after['devices']}:raise RuntimeError('Topology changed')
+            if any(r['acs']and r['acs']['ctrl']&MASKS[policy]and (r['bdf']in included or not boundary(r))for r in after['devices']):raise RuntimeError('ACS verification failed')
+            after.update(mode='disabled-'+policy,original_values=str(save),kernel_snapshot=str(companion))
+            return after
+        except BaseException as error:
+            if MODULE.exists():
+                try:restore()
+                except BaseException as rollback:raise RuntimeError(f'{error}; restore failed, module/snapshot retained: {rollback}')from error
+                raise RuntimeError(f'{error}; original controls restored')from error
+            raise
+        finally:
+            if fd>=0:os.close(fd)
+
+def audit(ports,policy=None,native=False,include_ports=None):
+    current=status(ports)
+    snapshot=kernel_snapshot()if SNAPSHOT.exists()else None
+    if snapshot and set(snapshot['ports'])!=set(ports):raise RuntimeError('Loaded snapshot scope differs')
+    policy=policy or (snapshot['policy']if snapshot else 'redirect')
+    included=include_set(ports,include_ports if include_ports is not None else snapshot.get('included_ports',snapshot.get('include_ports',True))if snapshot else False)
+    before={d['bdf']:d for d in snapshot['devices']}if snapshot else {}
+    now={d['bdf']:d for d in current['devices']}
+    drift=[d['bdf']for d in now.values()if d['acs']and d['acs']['ctrl']&MASKS[policy]and (d['bdf']in included or not boundary(d))and (not native or native_relevant(d,policy,included))]
+    added=sorted(set(now)-set(before))if snapshot else []
+    removed=sorted(set(before)-set(now))
+    replaced=sorted(b for b in before.keys()&now.keys()if before[b]['vendor_device']!=now[b]['vendor_device']or not before[b].get('same_device',True))
+    current.update(mode='audit',policy=policy,included_ports=sorted(included),drift=drift,new_devices=added,removed_devices=removed,replaced_devices=replaced,
+                   snapshot_available=snapshot is not None,compliant=not(drift or added or removed or replaced))
+    return current
+
+def reapply(ports,policy,save,power=True,include_ports=False):
+    policy=policy or 'redirect'
+    if MODULE.exists():
+        original=kernel_snapshot()
+        if set(original['ports'])!=set(ports):raise RuntimeError('Restore existing scope before changing ports')
+        restore(refresh=True)
+    return disable(ports,policy or 'redirect',save,require_idle=True,power=power,include_ports=include_ports)
+
+def native_selector(row):
+    """Anchor at the selected root; discard all descendant bus numbers."""
+    parts=Path(row['path']).parts
+    root=row['root_port']
+    try:chain=parts[parts.index(root):]
+    except ValueError:raise ValueError('Root missing from PCI sysfs ancestry')
+    if not chain or chain[-1]!=row['bdf']or any(normalize(p)!=p for p in chain):raise ValueError('Invalid PCI sysfs ancestry')
+    return root+''.join('/'+p.rsplit(':',1)[1]for p in chain[1:])
+
+
+def native_relevant(row,policy,include_ports=False):
+    # Keep supported controls even when currently clear: PCI init may enable
+    # them at the next boot. Never infer irrelevance from current ACSCtl.
+    if boundary(row)and not (include_ports is True or not isinstance(include_ports,bool)and row['bdf']in (include_ports or [])):
+        return False
+    return bool(row['acs']and row['acs']['cap']&MASKS[policy])
+
+
+def native_plan(ports,policy,include_ports=False):
+    include_ports=include_set(ports,include_ports)
+    all_rows=inventory(ports)
+    rows=[r for r in all_rows if native_relevant(r,policy,include_ports)]
+    selected=[r['bdf']for r in rows]
+    selectors=sorted(native_selector(r)for r in rows)
+    option='disable_acs_redir='+';'.join(selectors)if policy=='redirect'else 'config_acs='+';'.join('0000000@'+b for b in selectors)
+    return {'mode':'native-plan','ports':ports,'policy':policy,'included_ports':sorted(include_ports),'kernel_argument':'pci='+option if selectors else None,
+            'devices':selected,'selectors':selectors,'skipped':[{'bdf':r['bdf'],'reason':'selected port boundary preserved'if boundary(r)and r['bdf']not in include_ports else 'no standard ACS'if not r['acs']else 'no supported controls for '+policy}for r in all_rows if not native_relevant(r,policy,include_ports)],'note':'Exact root-anchored devfn paths, not recursive selectors; refresh after topology changes. No bootloader/config changes made. Unmasked native bits use firmware/current entry state.'}
+
+def restore(refresh=False):
+    if not MODULE.exists():
+        raise ValueError('Module not loaded; no in-kernel snapshot available')
+    (MODULE / ('parameters/refresh_restore' if refresh else 'parameters/restore')).write_text('1\n')
+    if (MODULE / 'parameters/remaining').read_text().strip() != '0':
+        raise RuntimeError('Some controls could not be restored; module kept loaded')
+    subprocess.run(['/usr/sbin/modprobe', '-r', 'pci_acs_scope'], check=True)
+    return {'mode': 'restored', 'note': 'Restored captured bits; not generic BIOS defaults'}
+
+
+@contextlib.contextmanager
+def action_lock():
+    with open('/run/lock/pci-acs-scope.lock', 'a') as f:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    for name in ('status', 'disable', 'audit', 'reapply', 'native-plan'):
+        p = commands.add_parser(name)
+        add_port_arguments(p,include=name!='status')
+        if name!='status':p.add_argument('--policy',choices=MASKS,default='redirect'if name in ('disable','reapply','native-plan')else None)
+        if name in ('disable','reapply'):
+            p.add_argument('--no-wake',action='store_true')
+            p.add_argument('--require-idle',action='store_true')
+            p.add_argument('--save', required=True, type=Path, help='New file for original register values')
+    commands.add_parser('restore')
+    args = parser.parse_args(argv)
+    try:
+        marker=BACKEND
+        if marker.exists()and marker.read_text().strip()=='native'and args.command in ('disable','restore','reapply'):
+            raise RuntimeError('Native package only configures kernel boot parameters; use pci-acs-boot enable/disable')
+        if args.command not in ('restore',):
+            ports,included=parse_scope(args)
+        if args.command in ('status','audit','native-plan'):
+            result=status(ports)if args.command=='status'else audit(ports,args.policy,include_ports=included if included else None)if args.command=='audit'else native_plan(ports,args.policy or 'redirect',included)
+        else:
+            if os.geteuid() != 0:
+                raise PermissionError('Root access required')
+            with action_lock():
+                if args.command=='restore':result=restore()
+                elif args.command=='reapply':result=reapply(ports,args.policy,args.save,not args.no_wake,included)
+                else:result=disable(ports,args.policy,args.save,args.require_idle,not args.no_wake,included)
+        print(json.dumps(result, indent=2))
+        return 2 if result.get('mode')=='audit'and not result['compliant'] else 0
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
+        print('pci-acs-scope: ' + str(e), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

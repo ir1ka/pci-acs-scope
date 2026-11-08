@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+# Compose with the generated udev entry without knowing other packages.
+case ${1:-} in prereqs) exit 0;; esac
+cfg=/etc/pci-acs-scope/boot.json
+[ -f "$cfg" ] || exit 0
+backend=$(/usr/sbin/pci-acs-boot kernel-backend --kernel "$version")
+if [ "$backend" != module ]; then
+ echo "I: ACS $version uses native $backend via managed GRUB configuration" >&2
+ exit 0
+fi
+prebuilt=/usr/share/pci-acs-scope/prebuilt-kernels
+if [ -f "$prebuilt" ] && ! grep -Fxq "$version" "$prebuilt"; then
+ echo "E: ACS module fallback requires a module for $version (install DKMS or matching prebuilt)" >&2;exit 1;fi
+. /usr/share/initramfs-tools/hook-functions
+. /usr/share/pci-acs-scope/initramfs-runtime
+[ -s "$DESTDIR/scripts/init-top/udev" ] || { echo 'E: init-top/udev missing' >&2;exit 1; }
+modinfo -k "$version" -p pci_acs_scope | grep -q '^require_idle:'
+modinfo -k "$version" -p pci_acs_scope | grep -q '^wake:'
+modinfo -k "$version" -p pci_acs_scope | grep -q '^include_ports:'
+modinfo -k "$version" -p pci_acs_scope | grep -q '^include:'
+mkdir -p "$DESTDIR/conf" "$DESTDIR/lib/pci-acs-scope"
+python3 - "$cfg" "$DESTDIR/conf/pci-acs-scope" <<'PY'
+import json,re,sys
+c=json.load(open(sys.argv[1]));ports=c['ports'];policy=c['policy']
+assert c['schema']==1 and c['managed_by']=='pci-acs-boot' and ports and policy in ('off','redirect')
+assert all(re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]',p)for p in ports)
+included=c.get('included_ports',ports if c.get('include_ports',False)else [])
+assert isinstance(included,list)and set(included)<=set(ports)
+open(sys.argv[2],'w').write(','.join(ports)+'\n'+policy+'\n'+','.join(included)+'\n')
+PY
+# The module is staged uncompressed by initramfs-runtime.
+if [ -f "$DESTDIR/lib/pci-acs-scope/udev.original" ]; then
+ cmp -s "$DESTDIR/scripts/init-top/udev" /usr/share/pci-acs-scope/early-udev-wrapper || {
+  echo 'E: ACS udev entry changed during image build' >&2;exit 1;
+ }
+else
+ cp -p "$DESTDIR/scripts/init-top/udev" "$DESTDIR/lib/pci-acs-scope/udev.original"
+fi
+cp /usr/share/pci-acs-scope/early-udev-wrapper "$DESTDIR/scripts/init-top/udev"
+cp /usr/share/pci-acs-scope/run-early "$DESTDIR/lib/pci-acs-scope/run-early"
+chmod 755 "$DESTDIR/scripts/init-top/udev" "$DESTDIR/lib/pci-acs-scope/run-early"

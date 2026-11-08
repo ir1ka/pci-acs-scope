@@ -1,0 +1,53 @@
+#!/bin/sh
+# initramfs only; no policy action unless an explicit configuration was embedded.
+set -u
+PATH=${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+log() { echo "pci-acs early: $*" >&2; }
+# Reuse the image's existing applets; no private binaries or kmod extensions.
+for tool in insmod rmmod cat grep sed mkdir chmod; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        log "required system command missing: $tool; skipped"; exit 0;
+    }
+done
+case " $(cat /proc/cmdline) " in *' pci_acs_scope_boot=off '*) log bypassed;exit 0;; esac
+[ -r /conf/pci-acs-scope ] || exit 0
+ports=$(sed -n '1p' /conf/pci-acs-scope)
+policy=$(sed -n '2p' /conf/pci-acs-scope)
+included=$(sed -n '3p' /conf/pci-acs-scope)
+[ -n "$ports" ] || exit 0
+case "$policy" in off|redirect) ;; *) log 'invalid policy';exit 0;; esac
+if [ -d /sys/module/pci_acs_scope ]; then
+ if [ "$(cat /sys/module/pci_acs_scope/parameters/execute 2>/dev/null)" = N ]; then
+  rmmod pci_acs_scope || exit 0
+ else
+  log 'already loaded; preserving original snapshot';exit 0
+ fi
+fi
+rollback() {
+ if [ -d /sys/module/pci_acs_scope ]; then
+  if echo 1 > /sys/module/pci_acs_scope/parameters/restore && [ "$(cat /sys/module/pci_acs_scope/parameters/remaining)" = 0 ]; then
+   rmmod pci_acs_scope || :
+  else
+   log 'restore failed; module and authoritative /proc snapshot retained'
+  fi
+ fi
+}
+mkdir -p /run/pci-acs-scope
+chmod 700 /run/pci-acs-scope
+log "applying $policy to $ports before udev"
+set -- execute=1 require_idle=1 wake=1 "ports=$ports" "policy=$policy" include_ports=0
+[ -z "$included" ] || set -- "$@" "include=$included"
+if ! insmod /lib/pci-acs-scope/pci_acs_scope.ko "$@"; then
+ log 'module execution failed; continuing udev';exit 0
+fi
+umask 077
+if ! cat /proc/pci_acs_scope_snapshot > /run/pci-acs-scope/boot-before.kernel.json; then
+ log 'cannot persist authoritative snapshot';rollback;exit 0
+fi
+if [ "$(cat /sys/module/pci_acs_scope/parameters/failed)" != N ]; then
+ log 'partial failure';rollback;exit 0
+fi
+# Dirty snapshots pin the module; explicit restore is required before unload.
+log 'policy applied; module retained for explicit restoration'
+exit 0

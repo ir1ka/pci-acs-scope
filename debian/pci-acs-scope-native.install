@@ -1,0 +1,8 @@
+bin/pci-acs-scope usr/sbin
+bin/pci-acs-boot usr/sbin
+bin/pci-acs-native usr/sbin
+kernel/zz-pci-acs-scope etc/kernel/postinst.d
+kernel/zz-pci-acs-scope etc/kernel/postrm.d
+lib/pci-acs-audit lib/systemd/system-sleep
+systemd/pci-acs-audit.service lib/systemd/system
+systemd/pci-acs-audit.timer lib/systemd/system

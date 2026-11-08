@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+if [ "${1:-}" = configure ] && [ -f /etc/pci-acs-scope/boot.json ]; then
+ /usr/sbin/pci-acs-boot refresh
+fi

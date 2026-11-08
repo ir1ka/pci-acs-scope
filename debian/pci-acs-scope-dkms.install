@@ -1,0 +1,14 @@
+bin/pci-acs-scope usr/sbin
+src/pci_acs_scope.c usr/src/pci-acs-scope-0.5.0/src
+src/Makefile usr/src/pci-acs-scope-0.5.0/src
+bin/pci-acs-boot usr/sbin
+initramfs/pci-acs-scope usr/share/initramfs-tools/hooks
+lib/early-udev-wrapper usr/share/pci-acs-scope
+lib/run-early usr/share/pci-acs-scope
+lib/pci-acs-audit lib/systemd/system-sleep
+systemd/pci-acs-audit.service lib/systemd/system
+systemd/pci-acs-audit.timer lib/systemd/system
+bin/pci-acs-native usr/sbin
+kernel/zz-pci-acs-scope etc/kernel/postinst.d
+kernel/zz-pci-acs-scope etc/kernel/postrm.d
+lib/initramfs-runtime usr/share/pci-acs-scope

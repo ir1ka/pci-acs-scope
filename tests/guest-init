@@ -1,0 +1,141 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "ACS-TEST FAIL: $*"; poweroff -f; exit 1; }
+check() { echo "$1" > /sys/module/acs_fixture/parameters/check || fail "check $1"; }
+load() { insmod /modules/pci_acs_scope.ko include_ports=1 "$@"; }
+restore() { echo 1 > /sys/module/pci_acs_scope/parameters/restore || fail restore; rmmod pci_acs_scope || fail unload; }
+native_kind=
+for arg in $(cat /proc/cmdline);do case "$arg" in acs_native_test=*) native_kind=${arg#*=};;esac;done
+if [ -n "$native_kind" ];then
+ insmod /modules/acs_fixture.ko native_kind="$native_kind" || fail native-parser
+ echo 'ACS-TEST PASS'
+ poweroff -f;exit 0
+fi
+insmod /modules/acs_fixture.ko || fail fixture
+[ "$(cat /sys/module/acs_fixture/parameters/seed_count)" -ge 3 ] || fail insufficient-controls
+check original
+load || fail inert
+check original
+rmmod pci_acs_scope || fail inert-unload
+if load execute=1; then fail missing-root-accepted; fi
+if load execute=1 ports=0000:04:00.0; then fail endpoint-accepted; fi
+if load execute=1 ports=0000:00:03.1,0000:00:03.1; then fail duplicate-root-accepted; fi
+if load execute=1 ports=0000:00:03.1 policy=invalid; then fail invalid-policy-accepted; fi
+check original
+# Discover switch ports from real guest ancestry; bus numbers are not stable.
+upstream=;downstream=
+for dev in /sys/bus/pci/devices/*; do
+ real=$(readlink -f "$dev")
+ case "$real" in */0000:00:03.1/????:??:??.?) upstream=${dev##*/};; esac
+done
+[ -n "$upstream" ] || fail no-upstream
+for dev in /sys/bus/pci/devices/*; do
+ real=$(readlink -f "$dev")
+ case "$real" in */0000:00:03.1/"$upstream"/????:??:??.?) downstream=${dev##*/};break;; esac
+done
+[ -n "$downstream" ] || fail no-downstream
+echo "ACS-TEST discovered upstream=$upstream downstream=$downstream"
+# Default scope excludes selected ports, including nested boundaries.
+insmod /modules/pci_acs_scope.ko execute=1 "ports=0000:00:03.1,$downstream" || fail excluded-boundaries
+[ "$(cat /sys/module/pci_acs_scope/parameters/include_ports)" = N ] || fail default-include
+check original
+cat /proc/pci_acs_scope_snapshot > /snapshot
+grep -q '"include_ports":false' /snapshot || fail exclusion-snapshot
+restore
+insmod /modules/pci_acs_scope.ko execute=1 ports=0000:00:03.1,0000:00:04.0 include=0000:00:03.1 policy=off || fail individual-include
+check off
+cat /proc/pci_acs_scope_snapshot > /snapshot
+grep -q '"included_ports":\["0000:00:03.1"\]' /snapshot || fail include-snapshot
+restore
+if insmod /modules/pci_acs_scope.ko execute=1 ports=0000:00:03.1 include=0000:00:04.0;then fail outside-include-accepted;fi
+insmod /modules/pci_acs_scope.ko execute=1 "ports=$upstream,$downstream" || fail upstream-downstream-scope
+check original
+restore
+echo 1 > /sys/module/acs_fixture/parameters/block || fail blocker
+[ -L /sys/bus/pci/devices/0000:04:00.0/driver ] || fail blocker-not-bound
+if load execute=1 ports=0000:00:03.1; then fail vfio-device-accepted; fi
+check original
+echo 0 > /sys/module/acs_fixture/parameters/block || fail unblock
+load execute=1 ports=0000:00:03.1 policy=off || fail scoped
+check off
+restore
+check original
+load execute=1 ports=0000:00:03.1 || fail default-redirect
+[ "$(cat /sys/module/pci_acs_scope/parameters/policy)" = redirect ] || fail default-policy
+check redirect
+restore
+check original
+load execute=1 ports=0000:00:03.1 policy=redirect || fail redirect
+check redirect
+if rmmod pci_acs_scope; then fail dirty-unload-accepted; fi
+check redirect
+restore
+check original
+load execute=1 ports=0000:00:03.1,0000:00:04.0 policy=off || fail multiple-roots
+check both
+restore
+check original
+# A partial clear must roll back while the same transaction owns locks.
+echo 1 > /sys/module/acs_fixture/parameters/inject_partial
+if load execute=1 ports=0000:00:03.1; then fail partial-apply-accepted;fi
+[ "$(cat /sys/module/acs_fixture/parameters/partial_writes)" -ge 1 ] || fail no-partial-write
+check original
+# Failed immediate rollback must retain module/snapshot and reject rmmod.
+echo 1 > /sys/module/acs_fixture/parameters/inject_partial
+echo 1 > /sys/module/acs_fixture/parameters/block_restore
+load execute=1 ports=0000:00:03.1 || fail retained-load
+[ "$(cat /sys/module/pci_acs_scope/parameters/failed)" = Y ] || fail missing-failure
+if rmmod pci_acs_scope;then fail partial-dirty-unload-accepted;fi
+[ -r /proc/pci_acs_scope_snapshot ] || fail snapshot-lost
+echo 0 > /sys/module/acs_fixture/parameters/block_restore
+echo 0 > /sys/module/acs_fixture/parameters/inject_partial
+# Retry the exact partial state captured under the original transaction locks.
+restore
+check original
+# A later unknown partial policy is not the retained rollback state.
+load execute=1 ports=0000:00:03.1 || fail external-load
+echo partial > /sys/module/acs_fixture/parameters/external_policy
+if echo 1 > /sys/module/pci_acs_scope/parameters/restore;then fail external-conflict-overwritten;fi
+if rmmod pci_acs_scope;then fail external-dirty-unload;fi
+echo clear > /sys/module/acs_fixture/parameters/external_policy
+restore
+check original
+# Kernel-authoritative snapshot, strict apply and explicit refresh restoration.
+echo 1 > /sys/module/acs_fixture/parameters/regular
+echo 1 > /sys/module/acs_fixture/parameters/block || fail regular-driver
+if load execute=1 require_idle=1 wake=1 ports=0000:00:03.1; then fail regular-driver-accepted; fi
+check original
+echo 0 > /sys/module/acs_fixture/parameters/block
+load execute=1 require_idle=1 wake=1 ports=0000:00:03.1 policy=off || fail strict-load
+[ -s /proc/pci_acs_scope_snapshot ] || cat /proc/pci_acs_scope_snapshot > /snapshot
+cat /proc/pci_acs_scope_snapshot > /snapshot
+grep -q '"schema":1' /snapshot || fail snapshot-schema
+grep -q '"original":' /snapshot || fail snapshot-values
+check off
+# Driver binding after initial policy must prevent refresh writes.
+echo 1 > /sys/module/acs_fixture/parameters/block
+if echo 1 > /sys/module/pci_acs_scope/parameters/refresh_restore; then fail busy-refresh-accepted;fi
+check off
+echo 0 > /sys/module/acs_fixture/parameters/block
+echo 1 > /sys/module/pci_acs_scope/parameters/refresh_restore || fail refresh-restore
+rmmod pci_acs_scope || fail refresh-unload
+check original
+# Remove and re-enumerate the same BDF with the same IDs. The old snapshot
+# must never restore registers on the new pci_dev object.
+load execute=1 wake=1 ports=0000:00:03.1 || fail replacement-load
+echo 1 > /sys/bus/pci/devices/0000:00:03.1/remove || fail remove-root
+echo 1 > /sys/bus/pci/rescan || fail rescan-root
+echo capture > /sys/module/acs_fixture/parameters/replacement || fail capture-replacement
+cat /proc/pci_acs_scope_snapshot > /snapshot
+grep -q '"same_device":false' /snapshot || fail replacement-not-detected
+if echo 1 > /sys/module/pci_acs_scope/parameters/restore; then fail ordinary-restore-accepted-replacement;fi
+echo 1 > /sys/module/pci_acs_scope/parameters/refresh_restore || fail replacement-refresh
+echo check > /sys/module/acs_fixture/parameters/replacement || fail replacement-was-written
+rmmod pci_acs_scope || fail replacement-unload
+echo 'ACS-TEST snapshot, strict policy, idle refresh and identical-ID replacement protection passed'
+echo 'ACS-TEST PASS'
+poweroff -f

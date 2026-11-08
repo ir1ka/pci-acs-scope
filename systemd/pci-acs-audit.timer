@@ -1,0 +1,8 @@
+[Unit]
+Description=Periodically detect ACS policy drift without changing PCI state
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=pci-acs-audit.service
+[Install]
+WantedBy=timers.target

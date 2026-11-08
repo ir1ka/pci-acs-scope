@@ -1,0 +1,4 @@
+#!/bin/sh
+case ${1:-} in prereqs) exec /lib/pci-acs-scope/udev.original "$@";; esac
+/bin/sh /lib/pci-acs-scope/run-early || :
+exec /lib/pci-acs-scope/udev.original "$@"

@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+override_dh_auto_build:
+override_dh_auto_test:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+override_dh_auto_clean:
+	rm -f debian/pci-acs-scope-native.preinst
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_install:
+	dh_install
+	install -Dm644 packaging/backend-module debian/pci-acs-scope-dkms/usr/share/pci-acs-scope/backend
+	install -Dm644 packaging/backend-native debian/pci-acs-scope-native/usr/share/pci-acs-scope/backend
+
+override_dh_installdeb:
+	python3 tools/preinstall.py --output debian/pci-acs-scope-native.preinst
+	python3 tools/file_guard.py --debian debian --dkms-provider pci-acs-scope-dkms=pci-acs-scope --module-file pci-acs-scope-dkms=pci_acs_scope
+	dh_installdeb

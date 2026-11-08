@@ -1,0 +1,8 @@
+[Unit]
+Description=Read-only audit of the configured PCIe ACS policy
+ConditionPathExists=/etc/pci-acs-scope/boot.json
+After=systemd-udev-settle.service
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pci-acs-boot audit
+SuccessExitStatus=2

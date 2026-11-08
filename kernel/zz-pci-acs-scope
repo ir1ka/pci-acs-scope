@@ -1,0 +1,4 @@
+#!/bin/sh
+# Kernel lifecycle integration; does not load modules or change live PCI state.
+set -eu
+[ ! -f /etc/pci-acs-scope/boot.json ] || /usr/sbin/pci-acs-boot refresh --no-initramfs

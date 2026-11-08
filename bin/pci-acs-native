@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""Inspect the actual target kernel image for built-in ACS parameter handlers."""
+import bz2,lzma,subprocess,zlib
+from pathlib import Path
+
+BOOT=Path('/boot')
+GRUB=Path('/etc/default/grub.d/60-pci-acs-scope.cfg')
+MARKER='# Managed by pci-acs-boot; do not edit.'
+
+def image_support(kernel):
+    if not kernel or '/' in kernel or kernel.startswith('.'):raise ValueError('Invalid target kernel ABI')
+    images=[BOOT/('vmlinuz-'+kernel),BOOT/('vmlinux-'+kernel),Path('/usr/lib/modules')/kernel/'vmlinuz']
+    image=next((p for p in images if p.is_file()),None)
+    result={'kernel':kernel,'image':str(image)if image else None,'parameters':[],'path_selectors':False,'reason':'kernel image unavailable; using module fallback'}
+    if image is None:return result
+    raw=image.read_bytes();data=raw if raw.startswith(b'\x7fELF')else None
+    # Linux x86 bzImage contains a compressed ELF payload. No version guesses:
+    # vendor backports and custom configurations must be checked individually.
+    formats=[(b'\x1f\x8b\x08',lambda b:zlib.decompressobj(31).decompress(b)),(b'\xfd7zXZ\x00',lambda b:lzma.LZMADecompressor().decompress(b)),(b'BZh',lambda b:bz2.BZ2Decompressor().decompress(b))]
+    for magic,decode in formats:
+        start=0
+        while data is None:
+            pos=raw.find(magic,start)
+            if pos<0:break
+            start=pos+1
+            try:candidate=decode(raw[pos:])
+            except (ValueError,EOFError,lzma.LZMAError,zlib.error,OSError):continue
+            if candidate.startswith(b'\x7fELF'):data=candidate
+    if data is None:
+        for magic,command in [(b'\x28\xb5\x2f\xfd',['zstd','-dc']),(b'\x02\x21\x4c\x18',['lz4','-dc']),(b'\x89LZO\x00',['lzop','-dc'])]:
+            start=0
+            while data is None:
+                pos=raw.find(magic,start)
+                if pos<0:break
+                start=pos+1
+                try:r=subprocess.run(command,input=raw[pos:],capture_output=True)
+                except OSError:break
+                if r.stdout.startswith(b'\x7fELF'):data=r.stdout
+    if data is None:
+        result['reason']='cannot extract kernel ELF (optional decompressor may be missing); using module fallback';return result
+    result['parameters']=[p for p in ('disable_acs_redir','config_acs')if p.encode()+b'=\x00'in data]
+    result['path_selectors']=b'/%x.%x%c\x00'in data and b'%x:%x:%x.%x%c\x00'in data
+    result['reason']='parameter parser strings found in target kernel ELF'if result['parameters']else 'no native ACS parameter parser found; using module fallback'
+    if result['parameters']and not result['path_selectors']:result['reason']='native parameter found but root-anchored selector parser not confirmed; using module fallback'
+    return result
+
+def choose(support,policy,grub_available):
+    supported=support['parameters']
+    if not support.get('path_selectors',False):return 'module'
+    if grub_available:
+        if policy=='redirect'and'disable_acs_redir'in supported:return 'disable_acs_redir'
+        if 'config_acs'in supported:return 'config_acs'
+    return 'module'
+
+def argument(backend,devices,policy):
+    import re
+    if backend not in ('disable_acs_redir','config_acs')or policy not in ('redirect','off'):raise ValueError('Invalid native backend/policy')
+    if backend=='disable_acs_redir'and policy!='redirect':raise ValueError('disable_acs_redir only implements redirect policy')
+    if any(not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7](?:/[01][0-9a-f]\.[0-7])*',d)for d in devices):raise ValueError('Invalid root-anchored PCI selector')
+    if not devices:raise RuntimeError('No ACS-capable devices in selected subtree')
+    if backend=='disable_acs_redir':return 'pci=disable_acs_redir='+';'.join(devices)
+    bits='x0x00xx'if policy=='redirect'else'0000000'
+    return 'pci=config_acs='+';'.join(bits+'@'+b for b in devices)
+
+def managed_grub():
+    if GRUB.exists()and not GRUB.read_text().startswith(MARKER+'\n'):raise RuntimeError('Refusing to overwrite unmanaged '+str(GRUB))
+
+def grub_text(arguments):
+    # Only validated, generated PCI parameter text is permitted in this shell file.
+    import re
+    text=' '.join(arguments)
+    if not re.fullmatch(r'[a-z0-9_=:;@./ x]*',text):raise ValueError('Invalid generated kernel arguments')
+    # Literal single quotes survive shell sourcing and protect semicolons in
+    # the linux command written by grub-mkconfig/10_linux.
+    quoted=' '.join("'"+arg+"'"for arg in arguments)
+    return MARKER+'\n# Root-anchored paths; refresh after topology changes.\nGRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} '+quoted+'"\n'

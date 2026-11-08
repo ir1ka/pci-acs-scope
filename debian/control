@@ -1,0 +1,37 @@
+Source: pci-acs-scope
+Section: kernel
+Priority: optional
+Maintainer: IriKa Qiu <qiujie.jq@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-sequence-dkms, python3, git
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/ir1ka/pci-acs-scope
+Vcs-Git: https://github.com/ir1ka/pci-acs-scope.git
+Vcs-Browser: https://github.com/ir1ka/pci-acs-scope
+
+Package: pci-acs-scope-dkms
+Architecture: all
+Provides: pci-acs-scope (= ${binary:Version})
+Depends: ${misc:Depends}, dkms (>= 3.0), python3, kmod, xz-utils, zstd, gzip, coreutils, sed, grep, findutils, gawk | mawk
+Recommends: linux-headers-amd64, pahole, initramfs-tools
+Conflicts: pci-acs-scope-prebuilt, pci-acs-scope-native
+Replaces: pci-acs-scope-prebuilt, pci-acs-scope-native
+Description: opt-in ACS controls scoped to PCIe port subtrees
+ Builds pci_acs_scope through DKMS without rebuilding the kernel.
+ Only descendants of selected root/upstream/downstream ports change by default.
+ Module loading is inert without execute=1 and a PCIe port list.
+ Boot policy and read-only auditing require explicit enable commands.
+ Installation never loads the module or enables a policy.
+
+Package: pci-acs-scope-native
+Architecture: all
+Provides: pci-acs-scope (= ${binary:Version})
+Pre-Depends: python3, zstd, lz4, lzop
+Depends: ${misc:Depends}, grub2-common
+Conflicts: pci-acs-scope-dkms, pci-acs-scope-prebuilt
+Replaces: pci-acs-scope-dkms, pci-acs-scope-prebuilt
+Description: explicit scoped ACS policy using native Linux PCI parameters
+ Uses disable_acs_redir/config_acs and a dedicated GRUB drop-in.
+ Pre-install checks every installed boot kernel for native support.
+ No custom kernel module, DKMS registration or initramfs hook is shipped.
+ Installation leaves policy disabled; user explicitly enables it.

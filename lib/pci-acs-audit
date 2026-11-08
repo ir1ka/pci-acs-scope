@@ -1,0 +1,4 @@
+#!/bin/sh
+# Queue only a read-only audit after resume; never reapply a policy here.
+[ "${1:-}" = post ] && [ -f /etc/pci-acs-scope/boot.json ] || exit 0
+systemctl --no-block start pci-acs-audit.service || :

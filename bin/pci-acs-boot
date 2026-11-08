@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+"""Explicit boot ACS policy and optional read-only periodic audit."""
+import hashlib,fcntl,argparse,importlib.machinery,importlib.util,json,os,shutil,subprocess,sys,tempfile
+from pathlib import Path
+CONFIG=Path('/etc/pci-acs-scope/boot.json')
+STATE=Path('/var/lib/pci-acs-scope/early-image-state')
+MANAGER='pci-acs-boot'
+BACKEND=Path('/usr/share/pci-acs-scope/backend')
+def delivery_backend():
+    value=BACKEND.read_text().strip()if BACKEND.exists()else'module'
+    if value not in ('module','native'):raise RuntimeError('Invalid package backend marker')
+    return value
+def native():
+    path=Path(__file__).resolve().with_name('pci-acs-native')
+    loader=importlib.machinery.SourceFileLoader('acs_native_backend',str(path));spec=importlib.util.spec_from_loader(loader.name,loader)
+    m=importlib.util.module_from_spec(spec);loader.exec_module(m);return m
+NATIVE=native()
+def app():
+    path=Path(__file__).resolve().with_name('pci-acs-scope')
+    loader=importlib.machinery.SourceFileLoader('acs_scope_cli',str(path));spec=importlib.util.spec_from_loader(loader.name,loader)
+    m=importlib.util.module_from_spec(spec);loader.exec_module(m);return m
+
+def write_path(path):
+    safe_path(path)
+    with subprocess.Popen(['dpkg-query','-S',str(path)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)as query:
+        output=query.communicate()[0]
+        if query.returncode==1:return
+        if query.returncode!=0:raise RuntimeError('Cannot verify package ownership: '+str(path))
+    owners=set()
+    for line in output.splitlines():
+        head=line.split(': /',1)[0]
+        owners.update(item.strip().split(':',1)[0]for item in head.split(','))
+    if not owners or owners-set(('pci-acs-scope-dkms', 'pci-acs-scope-native', 'pci-acs-scope-prebuilt')):
+        raise RuntimeError('Refusing configuration owned by another package: '+str(path))
+
+def remove_file(path):
+    write_path(path);path.unlink(missing_ok=True)
+
+def safe_path(path):
+    if path.is_symlink()or any(p.is_symlink()for p in path.parents):
+        raise RuntimeError('Refusing symlink-managed path: '+str(path))
+    if path.exists()and not path.is_file():raise RuntimeError('Not a regular managed file: '+str(path))
+    if path==STATE and path.exists()and path.read_text().strip()not in ('enabled','enabling','rollback-rebuild-needed','disable-rebuild-needed'):
+        raise RuntimeError('Unmanaged image state; preserved: '+str(path))
+def plan_path():return STATE.with_name('boot-plan.json')
+def read_plan():
+    path=plan_path();safe_path(path)
+    if not path.exists():return None
+    value=json.loads(path.read_text())
+    if value.get('schema')!=1 or value.get('managed_by')!=MANAGER:
+        raise RuntimeError('Unmanaged boot plan: '+str(path))
+    return value
+def check_grub():
+    write_path(NATIVE.GRUB);NATIVE.managed_grub()
+    if not NATIVE.GRUB.exists():return
+    digest=hashlib.sha256(NATIVE.GRUB.read_bytes()).hexdigest()
+    plan=read_plan()
+    if plan and plan.get('grub_sha256')==digest:return
+    # Migrate only an exact legacy generated file matching its recorded args.
+    safe_path(CONFIG)
+    old=json.loads(CONFIG.read_text())if CONFIG.exists()else{}
+    if not plan and old.get('schema')==1 and old.get('managed_by')==MANAGER and 'native_arguments'in old:
+        if NATIVE.GRUB.read_text()==NATIVE.grub_text(old['native_arguments']):
+            atomic(plan_path(),json.dumps({'schema':1,'managed_by':MANAGER,'grub_sha256':digest})+'\n')
+            return
+    raise RuntimeError('GRUB file was modified or ownership cannot be proven; preserved: '+str(NATIVE.GRUB))
+
+def atomic(path,text):
+    write_path(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,name=tempfile.mkstemp(dir=path.parent,prefix='.acs-')
+    try:
+        with os.fdopen(fd,'w')as f:f.write(text);f.flush();os.fsync(f.fileno())
+        os.chmod(name,0o644);os.replace(name,path)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+def config():
+    safe_path(CONFIG)
+    raw=CONFIG.read_bytes();value=json.loads(raw)
+    if value.get('managed_by')!=MANAGER or value.get('schema')!=1:raise RuntimeError('Configuration is not tool-managed')
+    value.setdefault('included_ports',value['ports']if value.get('include_ports',False)else [])
+    value['included_ports']=sorted(app().include_set(value['ports'],value['included_ports']))
+    value['ports']=sorted(set(app().normalize(p)for p in value['ports']))
+    if not value['ports']or value['policy']not in ('off','redirect'):raise RuntimeError('Invalid ACS boot configuration')
+    plan=read_plan()
+    if plan and plan.get('config_sha256')==hashlib.sha256(raw).hexdigest():
+        value.update(plan.get('metadata',{}))
+    return value
+
+def grub_available():return bool(shutil.which('update-grub')and Path('/etc/default/grub').is_file())
+def backend(kernel,c):
+    if delivery_backend()=='module':
+        return {'kernel':kernel,'backend':'module','reason':'explicit module package'}
+    if not grub_available():raise RuntimeError('Native package requires update-grub and /etc/default/grub')
+    support=NATIVE.image_support(kernel)
+    selected=NATIVE.choose(support,c['policy'],grub_available())
+    if selected=='module':raise RuntimeError('Native package cannot implement '+c['policy']+' for '+kernel+': '+support['reason'])
+    return dict(support,backend=selected)
+def prepare_grub():
+    check_grub()
+    if not CONFIG.exists():
+        remove_file(NATIVE.GRUB);return
+    c=config();kernels=sorted({p.name.split('-',1)[1]for pattern in ('vmlinuz-*','vmlinux-*')for p in NATIVE.BOOT.glob(pattern)})
+    if delivery_backend()=='native'and not kernels:raise RuntimeError('No target kernel image available for native policy')
+    plans=[backend(k,c)for k in kernels]
+    selected=sorted({p['backend']for p in plans}-{'module'})
+    c['kernel_backends']=plans
+    if selected:
+        plan=app().native_plan(c['ports'],c['policy'],c['included_ports']);devices=plan['devices'];selectors=plan['selectors']
+        arguments=[NATIVE.argument(b,selectors,c['policy'])for b in selected]if selectors else []
+        if arguments:atomic(NATIVE.GRUB,NATIVE.grub_text(arguments))
+        else:remove_file(NATIVE.GRUB)
+        c['native_devices']=devices;c['native_selectors']=selectors;c['native_arguments']=arguments
+    else:
+        remove_file(NATIVE.GRUB);c['native_devices']=[];c['native_selectors']=[];c['native_arguments']=[]
+    metadata={k:v for k,v in c.items()if k=='kernel_backends'or k.startswith('native_')}
+    record={'schema':1,'managed_by':MANAGER,'config_sha256':hashlib.sha256(CONFIG.read_bytes()).hexdigest(),'grub_sha256':hashlib.sha256(NATIVE.GRUB.read_bytes()).hexdigest()if NATIVE.GRUB.exists()else None,'metadata':metadata}
+    atomic(plan_path(),json.dumps(record,indent=2)+'\n')
+def refresh(images=True):
+    previous_plan=read_plan()or{}
+    before=NATIVE.GRUB.read_bytes()if NATIVE.GRUB.exists()else None
+    prepare_grub()
+    after=NATIVE.GRUB.read_bytes()if NATIVE.GRUB.exists()else None
+    need_grub=delivery_backend()=='native'or before!=after or previous_plan.get('grub_rebuild_needed',False)
+    if need_grub:
+        plan=read_plan()or{'schema':1,'managed_by':MANAGER}
+        plan['grub_rebuild_needed']=True;atomic(plan_path(),json.dumps(plan,indent=2)+'\n')
+    if images and delivery_backend()=='module':subprocess.run(['update-initramfs','-u','-k','all'],check=True)
+    if need_grub:
+        if not grub_available():raise RuntimeError('update-grub is required to refresh the managed boot policy')
+        subprocess.run(['update-grub'],check=True)
+        plan.pop('grub_rebuild_needed',None)
+        plan['grub_sha256']=hashlib.sha256(NATIVE.GRUB.read_bytes()).hexdigest()if NATIVE.GRUB.exists()else None
+        atomic(plan_path(),json.dumps(plan,indent=2)+'\n')
+
+def audit_timer(enable):
+    tool=shutil.which('systemctl')
+    if not tool:raise RuntimeError('systemd is required for the optional audit timer')
+    args=[tool,'enable'if enable else'disable']
+    if Path('/run/systemd/system').exists():args+=['--now']
+    subprocess.run(args+['pci-acs-audit.timer'],check=True)
+def enable(ports,policy,include_ports=False):
+    write_path(CONFIG);write_path(STATE);read_plan()
+    check_grub()
+    ports=sorted(set(app().normalize(p)for item in ports for p in item.split(',')))
+    if not ports:raise RuntimeError('Explicit --ports required')
+    if delivery_backend()=='module'and not shutil.which('update-initramfs'):raise RuntimeError('initramfs-tools/update-initramfs is required')
+    previous=CONFIG.read_text()if CONFIG.exists()else None
+    if previous is not None:config()
+    previous_state=STATE.read_text()if STATE.exists()else None
+    value={'schema':1,'managed_by':MANAGER,'ports':ports,'policy':policy,'included_ports':sorted(app().include_set(ports,include_ports))}
+    atomic(STATE,'enabling\n');atomic(CONFIG,json.dumps(value,indent=2)+'\n')
+    try:refresh()
+    except (OSError,ValueError,RuntimeError,subprocess.CalledProcessError):
+        if previous is None:remove_file(CONFIG)
+        else:atomic(CONFIG,previous)
+        atomic(STATE,'rollback-rebuild-needed\n')
+        refresh()
+        if previous_state is None:remove_file(STATE)
+        else:atomic(STATE,previous_state)
+        raise RuntimeError('Enable failed; previous configuration and images restored')
+    atomic(STATE,'enabled\n')
+    print('ACS boot policy enabled; no runtime PCI changes or reboot.')
+def disable():
+    write_path(CONFIG);write_path(STATE);read_plan()
+    check_grub()
+    if CONFIG.exists():config()
+    if not CONFIG.exists()and not STATE.exists()and not NATIVE.GRUB.exists()and not plan_path().exists():return
+    # The optional timer may be enabled; stop it before dropping its config.
+    if shutil.which('systemctl'):
+        audit_timer(False)
+    atomic(STATE,'disable-rebuild-needed\n');remove_file(CONFIG)
+    refresh();remove_file(STATE)
+    read_plan();remove_file(plan_path())
+    print('ACS boot policy disabled for future boots (GRUB/initramfs); current ACS is unchanged.')
+def main():
+    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action',required=True)
+    en=sub.add_parser('enable');app().add_port_arguments(en);en.add_argument('--policy',choices=('redirect','off'),default='redirect')
+    for name in ('disable','status','audit','audit-enable','audit-disable'):sub.add_parser(name)
+    kb=sub.add_parser('kernel-backend');kb.add_argument('--kernel',required=True)
+    rf=sub.add_parser('refresh');rf.add_argument('--no-initramfs',action='store_true')
+    a=p.parse_args()
+    if a.action=='kernel-backend':
+        print(backend(a.kernel,config()if CONFIG.exists()else{'policy':'redirect'})['backend']);return 0
+    if a.action=='status':
+        print(json.dumps({'config':config()if CONFIG.exists()else None,'image_state':STATE.read_text().strip()if STATE.exists()else None,'backend':delivery_backend(),'note':'Configuration state only; audit checks current hardware.'},indent=2));return 0
+    if a.action=='audit':
+        if not CONFIG.exists():return 0
+        c=config()
+        selected_backend=backend(os.uname().release,c)['backend']
+        native_mode=selected_backend!='module'
+        result=app().audit(c['ports'],c['policy'],native=native_mode,include_ports=c['included_ports'])
+        if native_mode:
+            expected=set(c.get('native_selectors',c.get('native_devices',[])))
+            actual={app().native_selector(d)if 'native_selectors'in c else d['bdf']for d in result['devices']if app().native_relevant(d,c['policy'],c['included_ports'])}
+            result.update(backend='native',new_acs_devices=sorted(actual-expected),removed_acs_devices=sorted(expected-actual))
+            result['compliant']=result['compliant']and expected==actual
+            cmdline=Path('/proc/cmdline').read_text().split()
+            required=NATIVE.argument(selected_backend,sorted(expected),c['policy'])if expected else None
+            if expected and required not in cmdline:result.update(compliant=False,reason='configured native ACS argument missing from running kernel command line')
+        elif not result['snapshot_available']:result.update(compliant=False,reason='boot module snapshot missing')
+        print(json.dumps(result,indent=2))
+        if not result['compliant']:print('ACS policy/topology drift detected; no PCI changes made. Quiesce the subtree before explicit reapply.',file=sys.stderr)
+        return 0 if result['compliant']else 2
+    if os.geteuid()!=0:raise RuntimeError('Run configuration commands using sudo')
+    with open('/run/lock/pci-acs-boot.lock','a')as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if a.action=='refresh':
+            if CONFIG.exists():
+                refresh(images=not a.no_initramfs)
+                if not a.no_initramfs:atomic(STATE,'enabled\n')
+        elif a.action=='enable':enable(app().parse_scope(a)[0],a.policy,app().parse_scope(a)[1])
+        elif a.action=='disable':disable()
+        elif a.action=='audit-enable':config();audit_timer(True)
+        else:audit_timer(False)
+        return 0
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (OSError,ValueError,RuntimeError,subprocess.CalledProcessError)as e:print('pci-acs-boot: '+str(e),file=sys.stderr);sys.exit(1)
