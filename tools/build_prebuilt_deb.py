@@ -105,7 +105,7 @@ def package(a,p):
         copy(ROOT/'lib/pci-acs-audit','lib/systemd/system-sleep/pci-acs-audit',0o755)
         for name in ('pci-acs-audit.service','pci-acs-audit.timer'):copy(ROOT/'systemd'/name,'lib/systemd/system/'+name,0o644)
         (stage/'usr/share/pci-acs-scope/prebuilt-kernels').write_text(a.kernel+'\n')
-        for src, dest in [('README.md','README.md'), ('LICENSE','COPYING'), ('debian/copyright','copyright')]:
+        for src, dest in [('README.md','README.md'),('README.zh-CN.md','README.zh-CN.md'), ('LICENSE','COPYING'), ('debian/copyright','copyright')]:
             copy(ROOT/src, 'usr/share/doc/pci-acs-scope-prebuilt/'+dest, 0o644)
         control=stage/'DEBIAN';control.mkdir()
         from file_guard import text as ownership_guard
